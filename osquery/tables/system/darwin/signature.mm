@@ -21,41 +21,36 @@
 #include <osquery/logger/logger.h>
 #include <osquery/sql/sql.h>
 #include <osquery/tables/system/darwin/keychain.h>
+#include <osquery/tables/system/posix/openssl_utils.h>
 #include <osquery/utils/conversions/darwin/cfstring.h>
 #include <osquery/utils/conversions/tryto.h>
 #include <osquery/utils/expected/expected.h>
+
+#include <openssl/x509.h>
 
 namespace osquery {
 namespace tables {
 
 // Empty string runs default verification on a file
-std::set<std::string> kCheckedArches{"", "i386", "ppc", "arm", "x86_64"};
-
-int getOSMinorVersion() {
-  auto qd = SQL::selectAllFrom("os_version");
-  if (qd.size() != 1) {
-    return -1;
-  }
-
-  return tryTo<int>(qd.front().at("minor")).takeOr(-1);
-}
+// TODO: we may want to eventually add arm64e to this set. As of October 2021,
+// arm64 and arm64e are aliased and duplicated results are returned.
+std::set<std::string> kCheckedArches{
+    "", "i386", "ppc", "arm", "x86_64", "arm64"};
 
 // Get the flags to pass to SecStaticCodeCheckValidityWithErrors, depending on
 // the OS version.
-Status getVerifyFlags(SecCSFlags& flags, bool hashResources) {
-  static const auto minorVersion = getOSMinorVersion();
-  if (minorVersion == -1) {
-    return Status(-1, "Couldn't determine OS X version");
-  }
-
+Status getVerifyFlags(SecCSFlags& flags,
+                      bool hashResources,
+                      bool hashExecutable) {
   flags = kSecCSStrictValidate | kSecCSCheckAllArchitectures |
           kSecCSCheckNestedCode;
-  if (minorVersion > 8) {
-    flags |= kSecCSCheckNestedCode;
-  }
 
   if (!hashResources) {
     flags |= kSecCSDoNotValidateResources;
+  }
+
+  if (!hashExecutable) {
+    flags |= kSecCSDoNotValidateExecutable;
   }
 
   return Status(0, "ok");
@@ -64,6 +59,7 @@ Status getVerifyFlags(SecCSFlags& flags, bool hashResources) {
 Status genSignatureForFileAndArch(const std::string& path,
                                   const std::string& arch,
                                   bool hashResources,
+                                  bool hashExecutable,
                                   QueryData& results) {
   OSStatus result;
   SecStaticCodeRef static_code = nullptr;
@@ -107,11 +103,12 @@ Status genSignatureForFileAndArch(const std::string& path,
   Row r;
   r["path"] = path;
   r["hash_resources"] = INTEGER(hashResources);
+  r["hash_executable"] = INTEGER(hashExecutable);
   r["arch"] = arch;
   r["identifier"] = "";
 
   SecCSFlags flags = 0;
-  getVerifyFlags(flags, hashResources);
+  getVerifyFlags(flags, hashResources, hashExecutable);
   result = SecStaticCodeCheckValidityWithErrors(
       static_code, flags, nullptr, nullptr);
   if (result == errSecSuccess) {
@@ -197,11 +194,8 @@ Status genSignatureForFileAndArch(const std::string& path,
       auto length = CFDataGetLength(der_encoded_data);
       auto x509_cert = d2i_X509(nullptr, &der_bytes, length);
       if (x509_cert != nullptr) {
-        std::string subject;
-        std::string issuer;
-        std::string commonName;
-        genCommonName(x509_cert, subject, commonName, issuer);
-        r["authority"] = commonName;
+        auto opt_common_name = getCertificateCommonName(x509_cert);
+        r["authority"] = SQL_TEXT(opt_common_name.value_or(""));
         X509_free(x509_cert);
       } else {
         VLOG(1) << "Error decoding DER encoded certificate";
@@ -219,11 +213,13 @@ Status genSignatureForFileAndArch(const std::string& path,
 // Generate a signature for a single file.
 void genSignatureForFile(const std::string& path,
                          bool hashResources,
+                         bool hashExecutable,
                          QueryData& results) {
   for (const auto& arch : kCheckedArches) {
     // This returns a status but there is nothing we need to handle
     // here so we can safely ignore it
-    genSignatureForFileAndArch(path, arch, hashResources, results);
+    genSignatureForFileAndArch(
+        path, arch, hashResources, hashExecutable, results);
   }
 }
 
@@ -262,6 +258,20 @@ QueryData genSignature(QueryContext& context) {
     hashResources = (value != "0");
   }
 
+  auto hashExecContraints =
+      context.constraints["hash_executable"].getAll(EQUALS);
+  if (hashExecContraints.size() > 1) {
+    VLOG(1)
+        << "Received multiple constraint values for column hash_executable. "
+           "Only the first one will be evaluated.";
+  }
+
+  bool hashExecutable = true;
+  if (!hashExecContraints.empty()) {
+    const auto& value = *hashExecContraints.begin();
+    hashExecutable = (value != "0");
+  }
+
   @autoreleasepool {
     for (const auto& path_string : paths) {
       // Note: we are explicitly *not* using is_regular_file here, since you can
@@ -270,7 +280,7 @@ QueryData genSignature(QueryContext& context) {
       if (!pathExists(path_string).ok()) {
         continue;
       }
-      genSignatureForFile(path_string, hashResources, results);
+      genSignatureForFile(path_string, hashResources, hashExecutable, results);
     }
   }
 
