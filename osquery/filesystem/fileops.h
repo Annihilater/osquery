@@ -93,6 +93,7 @@ typedef struct win_stat {
   std::string volume_serial;
   std::string product_version;
   std::string file_version;
+  std::string original_filename;
 
 } WINDOWS_STAT;
 
@@ -241,6 +242,10 @@ class PlatformFile : private boost::noncopyable {
     return handle_;
   }
 
+  const boost::filesystem::path& getFilePath() const {
+    return fname_;
+  }
+
   /**
    * @brief Returns success if owner of the file is root.
    *
@@ -267,9 +272,6 @@ class PlatformFile : private boost::noncopyable {
 
   /// Return the modified, created, birth, updated, etc times.
   bool getFileTimes(PlatformTime& times);
-
-  /// Change the file times.
-  bool setFileTimes(const PlatformTime& times);
 
   /// Read a number of bytes into a buffer.
   ssize_t read(void* buf, size_t nbyte);
@@ -426,6 +428,19 @@ boost::filesystem::path getSystemRoot();
  * @return osquery::Status
  */
 Status platformLstat(const std::string& path, struct stat& d_stat);
+
+/**
+ * @brief Verifies if the provided file descriptor points to a file
+ *
+ */
+boost::optional<bool> platformIsFile(int fd);
+
+/**
+ * @brief Calls the platform specific version of fileno
+ *
+ * @return osquery::Status containing the errno
+ */
+Status platformFileno(FILE* file, int& fd);
 
 /**
  * @brief Populates the provided string with a textual representation of the

@@ -90,47 +90,61 @@ The level limits are as follows:
 Memory: default 200M, restrictive 100M
 CPU: default 10% (for 12 seconds), restrictive 5% (for 6 seconds)
 
-The normal level allows for 10 restarts if the limits are violated. The restrictive allows for only 4, then the service will be disabled. For both there is a linear backoff of 5 seconds, doubling each retry.
-
 It is better to set the level to disabled (`-1`) rather than disabling the watchdog outright, as the worker/watcher concept is used for extensions auto-loading too.
 
 The watchdog "profiles" can be overridden for Memory and CPU Utilization.
 
 `--watchdog_memory_limit=0`
 
-If this value is >0 then the watchdog level (`--watchdog_level`) for maximum memory is overridden. Use this if you would like to allow the `osqueryd` process to allocate more than 200M, but somewhere less than 1G. This memory limit is expressed as a value representing MB.
+If this value is >0 then the watchdog level (`--watchdog_level`) for maximum memory is overridden. Use this if you would like to allow the `osqueryd` process to allocate more than 200M, but somewhere less than 10G. This memory limit is expressed as a value representing MB.
 
 `--watchdog_utilization_limit=0`
 
-If this value is >0 then the watchdog level (`--watchdog_level`) for maximum sustained CPU utilization is overridden. Use this if you would like to allow the `osqueryd` process to use more than 10% of a thread for more than `--watchdog_latency_limit` seconds of wall time. The length of sustained utilization is configurable with `--watchdog_latency_limit`.
+If this value is >0 then the watchdog level (`--watchdog_level`) for maximum sustained CPU utilization is overridden. Use this if you would like to allow the `osqueryd` process to use more than 10% of CPU for `--watchdog_latency_limit` seconds of wall time.
 
-This value is a maximum number of CPU cycles counted as the `processes` table's `user_time` and `system_time`. The default is 90, meaning less 90 seconds of cpu time per 3 seconds of wall time is allowed.
+This value sets a maximum number of allowed CPU cycles counted as the `processes` table's `user_time` and `system_time`. The default value is `10`, meaning 10% of CPU utilization allowed.
+
+The CPU utilization limit is calculated the following way:
+```text
+cpu_limit_ms = number_of_cores * check_interval_ms * (watchdog_utilization_limit / 100.0)
+```
+Where:
+- `number_of_cores` is the number of all cpu cores (physical + virtual).
+- `check_interval_ms` is 3 seconds. It is how often the watchdog checks worker and extension processes for CPU utilization.
+
+Example: On a 2020 MacBook with Quad-Core Intel Core i7, the number of physical cores is 4 but `number_of_cores` is 8, thus by default the CPU utilization limit is `2400ms` meaning that every three seconds the processes are expected to use less than `2400ms` of CPU time (10% of all the CPU time `8 * 3000ms`).
+
+> NOTE: Before osquery 5.10.0, on systems with virtual cores, osquery is actually using the count of physical cores, which is normally half the amount, which results in setting the limit to half of the configured utilization (`1200ms` is actually 5% of the full `8 * 3000ms` CPU time).
 
 `--watchdog_latency_limit=0`
 
-If this value is >0 then the watchdog level (`--watchdog_level`) for time
-allowed to spend at maximum sustained CPU utilization is overridden. Use this
-if you would like to allow the `osqueryd` process to use more than the cpu
-utilization limit for longer than the defaults.
+If this value is >0 then the watchdog level (`--watchdog_level`) for time allowed to spend at maximum sustained CPU utilization is overridden. Use this if you would like to allow the `osqueryd` process to use more than the cpu utilization limit for longer than the defaults.
 
-This value is a duration in seconds that the watchdog allows osquery to spend
-at maximum sustained CPU utilization.
+This value is a duration in seconds that the watchdog allows osquery to spend at maximum sustained CPU utilization.
+
+The default value is 12 seconds.
 
 `--watchdog_delay=60`
 
 A delay in seconds before the watchdog process starts enforcing memory and CPU utilization limits. The default value `60s` allows the daemon to perform resource intense actions, such as forwarding logs, at startup.
 
+`--watchdog_forced_shutdown_delay=4`
+
+Amount of seconds to wait to issue a forced shutdown, after the watchdog has issued a graceful shutdown request to a worker or extension, due to resource limits being hit.
+Note that on Windows this doesn't have any effect currently, since the watchdog issues a TerminateProcess as a "graceful" shutdown, which immediately kills the process.
+
 `--enable_extensions_watchdog=false`
 
 By default the watchdog monitors extensions for improper shutdown, but NOT for performance and utilization issues. Enable this flag if you would like extensions to use the same CPU and memory limits as the osquery worker. This means that your extensions or third-party extensions may be asked to stop and restart during execution.
 
-`--utc=true`
+`--enable_watchdog_debug=false`
 
-Attempt to convert all UNIX calendar times to UTC.
+If set to true, every 3 seconds the watchdog will log the measured CPU utilization and memory footprint of all the monitored processes.
+(To generate the logs this flag requires `--verbose` to be set.)
 
 `--table_delay=0`
 
-Add a microsecond delay between multiple table calls (when a table is used in a JOIN). A `200` microsecond delay will trade about 20% additional time for a reduced 5% CPU utilization.
+Add a millisecond delay between multiple table calls (when a table is used in a JOIN). A `200` millisecond delay will trade about 20% additional time for a reduced 5% CPU utilization.
 
 `--hash_cache_max=500`
 
@@ -274,6 +288,10 @@ Use this only in emergency situations as size violations are dropped. It is extr
 
 This configures the max number of log lines to send every period (meaning every `logger_tls_period`).
 
+`--logger_tls_backoff_max=3600`
+
+Maximum seconds to wait before flushing logs over TLS/HTTPS. The exponential backoff kicks in when regular flush of buffered logs fails. Should be a multiple of `logger_tls_period`. 0 disables backoff. The max backoff time can be updated dynamically via `config_tls_endpoint`.
+
 `--distributed_tls_read_endpoint=`
 
 The URI path which will be used, in conjunction with `--tls_hostname`, to create the remote URI for retrieving distributed queries when using the **tls** distributed plugin.
@@ -329,6 +347,38 @@ Comma-delimited list of table names to be disabled. This allows osquery to be la
 
 Maximum file read size. The daemon or shell will first 'stat' each file before reading. If the reported size is greater than `read_max` a "file too large" error will be returned.
 
+## Linux-only runtime control flags
+
+`--malloc_trim_threshold=200`
+
+Memory threshold in MB used to decide when a malloc_trim will be called to reduce the retained memory.
+When the flag is not provided, the value will be chosen automatically between 80% of the `watchdog_memory_limit` if the watchdog is not disabled and 200MB in the case it is.
+Providing the flag with a value always overrides the automatic behavior and setting it to 0 completely disables calling malloc_trim.
+This is an attempt to reduce the amount of memory that the malloc allocator has in its caches in the worker process, which sometimes leads to hitting the watchdog memory limit more often.
+The downside is that in some cases there can be a performance hit in a query execution, since the cache was there to speed up future allocations.
+Note: When the watchdog starts, it takes a snapshot of the amount of memory that the worker uses in that moment; from that value then it adds the allocated memory limit set in `watchdog_memory_limit` and finds at how much memory used by the worker it should trigger.
+This means that if the `watchdog_memory_limit` is set to 200MB, the watchdog triggers at 200MB + something (around 15 to 30MB) used, not at 200MB. The malloc_trim system though doesn't have access to that information, so the best thing it can do is to use `watchdog_memory_limit` to calculate its own threshold.
+This should be good enough, but the user should be aware that how soon malloc_trim acts in respect to how soon the watchdog would've acted is actually slightly variable.
+
+
+## Windows-only runtime control flags
+
+`--users_service_delay=250`
+
+Defines the amount of milliseconds to wait during a scan of users information, between a batch of 100 users and the other. This is meant to throttle the CPU usage of osquery and especially the LSASS process on a Windows Server DC. The first users batch is always gathered immediately at the start of the scan.
+
+`--users_service_interval=1800`
+
+Defines the amount of seconds to wait between full scans of users information. The background service first obtains a list of all the users that are present on a machine, then start obtaining their details, using `users_service_delay` to slow down the process, then when the whole list has been processed, it will sleep `users_service_interval` seconds.
+
+`--groups_service_delay=150`
+
+Works the same as `users_service_delay`, but for the groups service. The default value is lower because collecting groups information is less performance intensive.
+
+`--groups_service_interval=1800`
+
+Works the same as `users_service_interval`, but for the groups service.
+
 ## Events control flags
 
 `--disable_events=false`
@@ -382,6 +432,18 @@ This is a comma-separated list of UDEV types to drop. On machines with flash-bac
 `--disable_endpointsecurity=true`
 
 Setting to `false` (in combination with `--disable_events=false`) turns on EndpointSecurity-based event collection within osquery (supported in macOS 10.15 and newer), and enables the use of the `es_process_events` table. This feature requires running osquery as root. It also requires that the osquery executable be code-signed and notarized to have the Endpoint Security client entitlement; official release builds of osquery will be appropriately code-signed. Lastly, it requires that the host give Full Disk Access permission to the osqueryd executable; for more information see the [process auditing section of osquery's deployment documentation](../deployment/process-auditing.md) as well as [installing osquery on macOS](./install-macos.md).
+
+`--disable_endpointsecurity_fim=true`
+
+Setting to `false` (in addition to `--disable_events=false` and `--disable_endpointsecurity=false`) will turn on EndpointSecurity based file event collection in osquery, running on macOS 10.15 and newer. This enables the use of `es_process_file_events` table.
+
+`--es_fim_mute_path_literal`
+
+This is a comma delimited list of path literals, which when set, is passed to EndpointSecurity based `es_process_file_events` table. This will result in events being muted for the paths set in here.
+
+`--es_fim_mute_path_prefix`
+
+This is a comma delimited list of path prefixes, which when set is passed to EndpointSecurity based `es_process_file_events` table. This will result in events being muted which match the path prefixes. 
 
 ## Logging/results flags
 
@@ -503,6 +565,11 @@ Log executing scheduled query names at the `INFO` level, and not the `VERBOSE` l
 
 Log executing distributed queries at the `INFO` level, and not the `VERBOSE` level
 
+`--decorations_top_level`
+
+Add decorators as top level JSON object members instead of being nested in a `decorations` member; this works for both result and status logs. For more details look at [Decorator queries](../deployment/configuration.md#decorator-queries) paragraph.  
+**NOTE**: Since osquery 5.10 the standard decorations like `unixTime`, `severity` and `line` are represented as true numbers in JSON, not as their string representations.
+
 ## Distributed query service flags
 
 `--distributed_plugin=tls`
@@ -586,3 +653,62 @@ Comma separated list of tables to disable. By default no tables are disabled.
 `--enable_tables=table1,table2`
 
 Comma separated list of tables to enable. By default every table is enabled. If a specific table is set in both `--enable_tables` and `--disable_tables`, disabling take precedence. If `--enable_tables` is defined and `--disable_tables` is not set, every table but the one defined in `--enable_tables` become disabled.
+
+## AWS
+
+`--aws_imdsv2_request_attempts=3`
+
+How many attempts to do at requesting an IMDSv2 token. Such a token is retrieved from an AWS metadata service that might not always be accessible, and it's used by plugins like the loggers `AWS Kinesis`, `AWS Firehose` or the EC2 tables.
+
+`--aws_imdsv2_request_interval=3`
+
+Base seconds to wait between attempts at requesting an IMDSv2 token. Scales quadratically with the number of attempts.
+
+`--aws_disable_imdsv1_fallback=false`
+
+Whether to disable support for IMDSv1 and fail if an IMDSv2 token could not be retrieved
+
+`--aws_enforce_fips`
+
+Enforces that only FIPS endpoints can be used for the logger plugins (Kinesis, Firehose), the STS authentication and the EC2 tables.  
+Using a non compliant region for the logger plugins will cause osquery to fail to start; for other non compliant cases the specific service will fail to work.  
+In all non compliant cases, an error or warning message will be printed. In verbose mode an additional message will show if a certain service has FIPS enforced.
+
+`--aws_region`
+
+Configure the default region to use for the AWS services and tables. If not specified and a more specific region flag is not provided,
+a fallback mechanism will be used, which will try to read the local profile configuration and take the region from there.  
+If that fails too, the default region of `us-east-1` will be chosen.
+
+`--aws_sts_region`
+
+Configure the region to use when acquiring STS credentials. If not specified, the `--aws_region` flag value will be used if set,
+otherwise its fallback mechanism will be used.
+
+`--aws_firehose_region`
+
+Configure the region to use for the AWS Firehose logger plugin. If not specified, the `--aws_region` flag value will be used if set,
+otherwise its fallback mechanism will be used.
+
+`--aws_kinesis_region`
+
+Configure the region to use for the AWS Kinesis logger plugin. If not specified, the `--aws_region` flag value will be used if set,
+otherwise its fallback mechanism will be used.
+
+## macOS keychain flags
+
+By default, Osquery limits frequent access to keychain files on macOS. This limit applies to `certificates`, `keychain_acls`, and `keychain_items` tables.
+
+`--keychain_access_cache=true`
+
+Whether to use a cache for keychain access (default true). The cache resides in-memory, and independent entries are used for each table and keychain file.
+If the keychain file has NOT been modified, osquery will return the cached result. The cache does not expire. It is cleared when osquery is restarted.
+
+`--keychain_access_interval=5`
+
+Minimum minutes required between keychain accesses (default is 5). Keychain cache must be enabled.
+The access interval is the minimum time that must elapse before osquery will open and read a keychain file.
+Starting from the first access and until time + `--keychain_access_interval`, osquery will return cached results for a given keychain file.
+The interval is applied independently for each table. Therefore, multiple tables can read the same keychain file, but they can only do so once within the interval.
+Since keychain files are generally not updated frequently, we expect that most keychain accesses will not be impacted by this interval.
+To disable the keychain access interval: `--keychain_access_interval=0`

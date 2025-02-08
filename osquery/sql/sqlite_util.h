@@ -458,6 +458,9 @@ class SQLInternal : private only_movable {
   /// ASCII escape the results of the query.
   void escapeResults();
 
+  /// Returns the size
+  uint64_t getSize();
+
  private:
   /// The internal member which holds the typed results of the query.
   QueryDataTyped resultsTyped_;
@@ -480,6 +483,11 @@ std::string getStringForSQLiteReturnCode(int code);
  * should be a non-const reference to a std::vector<Row>.
  */
 int queryDataCallback(void* argument, int argc, char* argv[], char* column[]);
+
+/**
+ * @brief Register versioning collations and function.
+ */
+void registerVersionExtensions(sqlite3* db);
 
 /**
  * @brief Register math-related 'custom' functions.
@@ -510,6 +518,11 @@ void registerEncodingExtensions(sqlite3* db);
  * @brief Register filesystem-related 'custom' functions.
  */
 void registerFilesystemExtensions(sqlite3* db);
+
+/**
+ * @brief Register network-related 'custom' functions.
+ */
+void registerNetworkExtensions(sqlite3* db);
 
 /**
  * @brief Generate the data for auto-constructed sqlite tables

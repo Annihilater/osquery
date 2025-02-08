@@ -404,6 +404,40 @@ TEST_F(ConfigTests, test_pack_restrictions) {
   }));
 }
 
+TEST_F(ConfigTests, test_pack_stats) {
+  auto doc = getExamplePacksConfig();
+  auto& packs = doc.doc()["packs"];
+  for (const auto& pack : packs.GetObject()) {
+    get().addPack(pack.name.GetString(), "", pack.value);
+  }
+
+  // Add performance stats for a query.
+  auto fullName = "pack_unrestricted_pack_process_events";
+  Row row;
+  row["user_time"] = "";
+  row["system_time"] = "";
+  row["resident_size"] = "";
+  get().recordQueryPerformance(fullName, 10, 10, row, row);
+  bool statFound = false;
+  Config::get().getPerformanceStats(fullName,
+                                    [&statFound](const QueryPerformance& perf) {
+                                      ASSERT_EQ(perf.executions, 1U);
+                                      statFound = true;
+                                    });
+  ASSERT_TRUE(statFound);
+
+  // Update the query SQL and make sure performance stats were cleared.
+  get().updateSource("", R"({"packs": {"unrestricted_pack": {"queries": {
+    "process_events": {"query": "select * from processes", "interval": 10}}}}})");
+  statFound = false;
+  Config::get().getPerformanceStats(fullName,
+                                    [&statFound](const QueryPerformance& perf) {
+                                      ASSERT_EQ(perf.executions, 0U);
+                                      statFound = true;
+                                    });
+  ASSERT_TRUE(statFound);
+}
+
 TEST_F(ConfigTests, test_pack_removal) {
   size_t pack_count = 0;
   get().packs(([&pack_count](const Pack& pack) { pack_count++; }));
@@ -795,5 +829,22 @@ TEST_F(ConfigTests, test_config_backup_integrate) {
   EXPECT_EQ(data_parser->config_, config_backup);
 
   FLAGS_config_enable_backup = config_enable_backup_saved;
+}
+
+TEST_F(ConfigTests, test_config_cli_flags) {
+  get().reset();
+
+  auto pack_delimiter = Flag::getValue("pack_delimiter");
+  ASSERT_NE(pack_delimiter, ",");
+  get().update({{"options", "{\"options\":{ \"pack_delimiter\": \",\" }}"}});
+  pack_delimiter = Flag::getValue("pack_delimiter");
+  ASSERT_EQ(pack_delimiter, ",");
+
+  Flag::updateValue("disable_watchdog", "true");
+  ASSERT_EQ(Flag::getValue("disable_watchdog"), "true");
+
+  get().update({{"options", "{\"options\":{ \"disable_watchdog\": false }}"}});
+
+  ASSERT_NE(Flag::getValue("disable_watchdog"), "false");
 }
 } // namespace osquery

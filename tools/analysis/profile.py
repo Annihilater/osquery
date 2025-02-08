@@ -84,13 +84,13 @@ def check_leaks_darwin(shell, query, count=1):
         if args.verbose:
             print(stdout)
         try:
-            for line in stdout.split("\n"):
-                if line.find("total leaked bytes") >= 0:
-                    leak_checks = line.split(":")[1].strip()
+            for line in stdout.split(b"\n"):
+                if line.find(b"total leaked bytes") >= 0:
+                    leak_checks = line.split(b":")[1].strip()
         except:
             print("Encountered exception while running leaks:")
             print(stdout)
-    return {"definitely": leak_checks}
+    return {"definitely": leak_checks.decode("utf-8")}
 
 
 def check_leaks(shell, query, count=1, supp_file=None):
@@ -262,6 +262,10 @@ if __name__ == "__main__":
         help="Use scheduled queries from a config."
     )
     group.add_argument(
+        "--pack", metavar="PACK", default=None,
+        help="Use queries from an osquery pack."
+    )
+    group.add_argument(
         "--query", metavar="STRING", default=None,
         help="Profile a single query."
     )
@@ -280,9 +284,8 @@ if __name__ == "__main__":
         help="Run the profile for N rounds and use the average."
     )
     group.add_argument(
-        "--shell", metavar="PATH", default="./build/%s/osquery/osqueryi" % (
-            utils.platform()),
-        help="Path to osqueryi shell (./build/<sys>/osquery/osqueryi)."
+        "--shell", metavar="PATH", default="./build/osquery/osqueryi",
+        help="Path to osqueryi shell (./build/osquery/osqueryi)."
     )
     group.add_argument(
         "--force", action="store_true", default=False,
@@ -330,7 +333,10 @@ if __name__ == "__main__":
         exit(1)
 
     queries = {}
+    query_source = "<none provided>"
+
     if args.config is not None:
+        query_source = args.config
         if not os.path.exists(args.config):
             print("Cannot find --config: %s" % (args.config))
             exit(1)
@@ -340,12 +346,24 @@ if __name__ == "__main__":
             for config_file in os.listdir(args.config + ".d"):
                 queries.update(utils.queries_from_config(os.path.join(
                     args.config + ".d", config_file)))
+    elif args.pack is not None:
+        queries = utils.queries_from_pack(args.pack)
     elif args.query is not None:
+        query_source = "--query"
         queries["manual"] = args.query
     elif args.force:
         queries["force"] = True
     else:
+        query_source = args.tables
         queries = utils.queries_from_tables(args.tables, args.restrict)
+
+    if len(queries) == 0:
+        print("0 queries were loaded from %s" % query_source)
+        exit(1)
+    elif len(queries) == 1:
+        print("%d query loaded from %s\n" % (len(queries), query_source))
+    else:
+        print("%d queries loaded from %s\n" % (len(queries), query_source))
 
     if args.leaks:
         results = profile_leaks(

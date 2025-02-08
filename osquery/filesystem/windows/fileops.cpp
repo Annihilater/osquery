@@ -10,9 +10,9 @@
 #include <osquery/filesystem/fileops.h>
 #include <osquery/logger/logger.h>
 #include <osquery/process/process.h>
-#include <osquery/process/windows/process_ops.h>
 #include <osquery/utils/conversions/windows/strings.h>
 #include <osquery/utils/conversions/windows/windows_time.h>
+#include <osquery/utils/system/windows/users_groups_helpers.h>
 
 #include <AclAPI.h>
 #include <LM.h>
@@ -38,8 +38,10 @@ namespace errc = boost::system::errc;
 
 namespace osquery {
 
-uint32_t getUidFromSid(PSID sid);
-uint32_t getGidFromSid(PSID sid);
+namespace {
+const std::wstring kTrustedInstallerSID{
+    L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"};
+}
 
 /*
  * Avoid having the same right being used in multiple CHMOD_* macros. Doing so
@@ -123,7 +125,7 @@ Status windowsGetVersionInfo(const std::string& path,
                              std::string& product_version,
                              std::string& file_version) {
   DWORD handle = 0;
-  std::wstring wpath = stringToWstring(path).c_str();
+  std::wstring wpath = stringToWstring(path);
   auto verSize = GetFileVersionInfoSizeW(wpath.c_str(), &handle);
   auto verInfo = std::make_unique<BYTE[]>(verSize);
   if (verInfo == nullptr) {
@@ -152,6 +154,145 @@ Status windowsGetVersionInfo(const std::string& path,
       std::to_string((pFileInfo->dwFileVersionLS >> 16 & 0xffff)) + "." +
       std::to_string((pFileInfo->dwFileVersionLS >> 0 & 0xffff));
   return Status::success();
+}
+
+typedef struct LANGANDCODEPAGE {
+  WORD wLanguage;
+  WORD wCodePage;
+} langandcodepage_t;
+
+// retrieve the list of languages and code pages from version information
+// resource
+Status getLanguagesAndCodepages(
+    const std::unique_ptr<BYTE[]>& versionInfo,
+    std::vector<langandcodepage_t>& langs_and_codepages) {
+  langandcodepage_t* lpTranslate = nullptr;
+  UINT cbTranslate = 0;
+
+  if (VerQueryValueW(versionInfo.get(),
+                     L"\\VarFileInfo\\Translation",
+                     (LPVOID*)&lpTranslate,
+                     &cbTranslate)) {
+    for (size_t i = 0; i < (cbTranslate / sizeof(langandcodepage_t)); ++i)
+      langs_and_codepages.push_back(lpTranslate[i]);
+    return Status::success();
+  }
+  return Status(GetLastError(), "Failed to read languages and code pages");
+}
+
+void initLanguagesAndCodepagesHeuristic(
+    std::vector<langandcodepage_t>& langs_and_codepages) {
+  langs_and_codepages.push_back({GetUserDefaultLangID(), 0x04B0});
+  langs_and_codepages.push_back({GetUserDefaultLangID(), 0x04E4});
+  langs_and_codepages.push_back({0x0409, 0x04B0}); // US English + CP_UNICODE
+  langs_and_codepages.push_back({0x0409, 0x04E4}); // US English + CP_USASCII
+  langs_and_codepages.push_back(
+      {0x0409, 0x0000}); // US English + unknown codepage
+}
+
+// retrieve OriginalFilename for language and code page from version information
+// resource
+Status getOriginalFilenameForCodepage(
+    const std::unique_ptr<BYTE[]>& versionInfo,
+    const langandcodepage_t& lang_and_codepage,
+    std::string& original_filename) {
+  WCHAR string_buf[50] = {'\0'};
+  size_t string_buf_size = ARRAYSIZE(string_buf);
+  WCHAR* lpBuffer = nullptr;
+  UINT dwBytes = 0;
+
+  HRESULT hr = StringCchPrintfW(string_buf,
+                                string_buf_size,
+                                L"\\StringFileInfo\\%04x%04x\\OriginalFilename",
+                                lang_and_codepage.wLanguage,
+                                lang_and_codepage.wCodePage);
+  if (SUCCEEDED(hr) &&
+      VerQueryValueW(
+          versionInfo.get(), string_buf, (LPVOID*)&lpBuffer, &dwBytes)) {
+    original_filename = wstringToString(lpBuffer);
+    return Status::success();
+  }
+  return Status(GetLastError(),
+                "Failed to retrieve OriginalFilename for codepage");
+}
+
+// retrieve OriginalFilename from version information resource
+// original_filename is only modified on successful read
+Status windowsGetOriginalFilename(const std::string& path,
+                                  std::string& original_filename) {
+  DWORD handle = 0;
+  std::wstring wpath = stringToWstring(path);
+
+  // GetFileVersionInfoSize
+  auto verSize =
+      GetFileVersionInfoSizeExW(FILE_VER_GET_NEUTRAL, wpath.c_str(), &handle);
+  if (verSize == 0) {
+    return Status(GetLastError(), "Failed to get file version info size");
+  }
+
+  // GetFileVersionInfo
+  std::unique_ptr<BYTE[]> verInfo;
+  try {
+    verInfo = std::make_unique<BYTE[]>(verSize);
+  } catch (std::bad_alloc /* e */) { /* empty body */
+  }
+  if (verInfo == nullptr) {
+    return Status(1, "Failed to malloc for version info");
+  }
+  auto err = GetFileVersionInfoExW(
+      FILE_VER_GET_NEUTRAL, wpath.c_str(), 0, verSize, verInfo.get());
+  if (err == 0) {
+    return Status(GetLastError(), "Failed to get file version info");
+  }
+
+  // retrieve the list of languages and code pages
+  std::vector<langandcodepage_t> langs_and_codepages;
+  auto stat = getLanguagesAndCodepages(verInfo, langs_and_codepages);
+  if (!stat.ok()) {
+    return stat;
+  }
+
+  // retrieve OriginalFilename for each language and code page, stop on first
+  // successful read
+  stat = Status::failure(
+      "Failed to retrieve OriginalFilename from version information resource");
+  for (size_t i = 0; i < langs_and_codepages.size(); ++i) {
+    stat = getOriginalFilenameForCodepage(
+        verInfo, langs_and_codepages[i], original_filename);
+    if (stat.ok()) {
+      break;
+    }
+  }
+  /*
+   * According to
+   * https://referencesource.microsoft.com/#system/services/monitoring/system/diagnosticts/FileVersionInfo.cs,469
+   * some dlls might not contain correct codepage information. In this case we
+   * will fail during lookup. Explorer will take a few shots in dark by trying
+   * following ID:
+   *
+   * 040904B0 // US English + CP_UNICODE
+   * 040904E4 // US English + CP_USASCII
+   * 04090000 // US English + unknown codepage
+   * Explorer also randomly guesses 041D04B0=Swedish+CP_UNICODE and
+   * 040704B0=German+CP_UNICODE sometimes. We will try to simulate similiar
+   * behavior here.
+   */
+  if (!stat.ok()) {
+    langs_and_codepages.clear();
+    initLanguagesAndCodepagesHeuristic(langs_and_codepages);
+    for (size_t i = 0; i < langs_and_codepages.size(); ++i) {
+      stat = getOriginalFilenameForCodepage(
+          verInfo, langs_and_codepages[i], original_filename);
+      if (stat.ok()) {
+        break;
+      }
+    }
+  }
+
+  return stat.ok() ? Status::success()
+                   : Status::failure(
+                         "Failed to retrieve OriginalFilename from "
+                         "version information resource");
 }
 
 static bool hasGlobBraces(const std::wstring& glob) {
@@ -190,7 +331,7 @@ static std::wstring globToRegex(const std::wstring& glob) {
   std::wstring regex(L"^");
 
   for (size_t i = 0; i < glob.size(); i++) {
-    char c = glob[i];
+    const wchar_t c = glob[i];
 
     switch (c) {
     case L'?':
@@ -770,10 +911,15 @@ static Status lowPrivWriteDenied(PACL acl) {
   std::vector<char> system_buffer(sid_buff_size, '\0');
   std::vector<char> administrators_buffer(sid_buff_size, '\0');
   std::vector<char> world_buffer(sid_buff_size, '\0');
+  std::vector<char> trusted_installer_buffer(sid_buff_size, '\0');
+  std::vector<char> creator_owner_buffer(sid_buff_size, '\0');
 
   auto system_sid = static_cast<PSID>(system_buffer.data());
   auto admins_sid = static_cast<PSID>(administrators_buffer.data());
   auto world_sid = static_cast<PSID>(world_buffer.data());
+  auto trusted_installer_sid =
+      static_cast<PSID>(trusted_installer_buffer.data());
+  auto creator_owner_sid = static_cast<PSID>(creator_owner_buffer.data());
 
   if (!CreateWellKnownSid(
           WinBuiltinAdministratorsSid, nullptr, system_sid, &sid_buff_size)) {
@@ -785,6 +931,14 @@ static Status lowPrivWriteDenied(PACL acl) {
   }
   if (!CreateWellKnownSid(WinWorldSid, nullptr, world_sid, &sid_buff_size)) {
     return Status(-1, "CreateWellKnownSid for Everyone failed");
+  }
+  if (!CreateWellKnownSid(
+          WinCreatorOwnerSid, nullptr, creator_owner_sid, &sid_buff_size)) {
+    return Status(-1, "CreateWellKnownSid for CREATOR OWNER failed");
+  }
+  if (!ConvertStringSidToSid(kTrustedInstallerSID.c_str(),
+                             &trusted_installer_sid)) {
+    return Status::failure("ConvertStringSidToSid for TrustedInstaller failed");
   }
 
   PVOID void_ent = nullptr;
@@ -820,9 +974,13 @@ static Status lowPrivWriteDenied(PACL acl) {
     if (entry->AceType == ACCESS_ALLOWED_ACE_TYPE) {
       auto allowed_ace = reinterpret_cast<PACCESS_ALLOWED_ACE>(entry);
 
-      // Administrators and SYSTEM are allowed Full access
+      /* Administrators, TrustedInstaller and SYSTEM are allowed Full access.
+         CREATOR OWNER doesn't give permissions to the object,
+         so we ignore it too. */
       if (EqualSid(&allowed_ace->SidStart, system_sid) ||
-          EqualSid(&allowed_ace->SidStart, admins_sid)) {
+          EqualSid(&allowed_ace->SidStart, admins_sid) ||
+          EqualSid(&allowed_ace->SidStart, trusted_installer_sid) ||
+          EqualSid(&allowed_ace->SidStart, creator_owner_sid)) {
         continue;
       }
 
@@ -918,15 +1076,6 @@ bool PlatformFile::getFileTimes(PlatformTime& times) {
           FALSE);
 }
 
-bool PlatformFile::setFileTimes(const PlatformTime& times) {
-  if (!isValid()) {
-    return false;
-  }
-
-  return (::SetFileTime(handle_, nullptr, &times.times[0], &times.times[1]) !=
-          FALSE);
-}
-
 ssize_t PlatformFile::getOverlappedResultForRead(void* buf,
                                                  size_t requested_size) {
   ssize_t nret = 0;
@@ -956,6 +1105,16 @@ ssize_t PlatformFile::getOverlappedResultForRead(void* buf,
       has_pending_io_ = true;
       last_read_.is_active_ = true;
       nret = -1;
+    } else if (last_error == ERROR_HANDLE_EOF) {
+      // We arrived at the end of the file. This normally happens only with
+      // empty files, or when over reading. In the other case where the last
+      // read gets all the final bytes, GetOverlappedResult will succeed and
+      // report no further pending data.
+
+      has_pending_io_ = false;
+      last_read_.is_active_ = false;
+      last_read_.buffer_.reset(nullptr);
+      nret = 0;
     } else {
       // Error has occurred, just in case, cancel all IO
       ::CancelIo(handle_);
@@ -1175,7 +1334,7 @@ bool platformSetSafeDbPerms(const std::string& path) {
     return false;
   }
 
-  std::wstring wide_path = stringToWstring(path.c_str());
+  std::wstring wide_path = stringToWstring(path);
   // Apply 'safe' DACL and avoid returning to attempt applying the DACL
   ret = SetNamedSecurityInfoW(
       const_cast<PWSTR>(wide_path.c_str()),
@@ -1699,9 +1858,9 @@ Status platformStat(const fs::path& path, WINDOWS_STAT* wfile_stat) {
   // inode is the decimal equivalent of fileid
   wfile_stat->inode = file_index;
 
-  wfile_stat->uid = getUidFromSid(sid_owner);
+  wfile_stat->uid = getRidFromSid(sid_owner);
 
-  wfile_stat->gid = getUidFromSid(gid_owner);
+  wfile_stat->gid = getRidFromSid(gid_owner);
 
   LocalFree(security_descriptor);
 
@@ -1799,6 +1958,9 @@ Status platformStat(const fs::path& path, WINDOWS_STAT* wfile_stat) {
                         wfile_stat->product_version,
                         wfile_stat->file_version);
 
+  windowsGetOriginalFilename(wstringToString(path.wstring()),
+                             wfile_stat->original_filename);
+
   CloseHandle(file_handle);
 
   return Status::success();
@@ -1813,5 +1975,24 @@ fs::path getSystemRoot() {
 
 Status platformLstat(const std::string& path, struct stat& d_stat) {
   return Status(1);
+}
+
+boost::optional<bool> platformIsFile(int fd) {
+  struct _stat64 d_stat {};
+  if (::_fstat64(fd, &d_stat) < 0) {
+    return boost::none;
+  }
+
+  return (d_stat.st_mode & _S_IFREG);
+}
+
+Status platformFileno(FILE* file, int& fd) {
+  fd = ::_fileno(file);
+
+  if (fd < 0) {
+    return Status(errno);
+  }
+
+  return Status::success();
 }
 } // namespace osquery

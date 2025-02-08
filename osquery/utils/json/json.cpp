@@ -11,6 +11,8 @@
 
 #include <osquery/utils/conversions/tryto.h>
 
+#include <algorithm>
+
 namespace rj = rapidjson;
 
 namespace osquery {
@@ -387,6 +389,44 @@ bool JSON::valueToBool(const rj::Value& value) {
     return (value.GetInt() != 0);
   }
   return false;
+}
+
+boost::optional<std::string> JSON::valueToString(const rj::Value& value) {
+  switch (value.GetType()) {
+  case rapidjson::Type::kFalseType: {
+    return std::string{"0"};
+  }
+  case rapidjson::Type::kTrueType: {
+    return std::string{"1"};
+  }
+  case rapidjson::Type::kNumberType: {
+    if (value.IsInt()) {
+      return std::to_string(value.GetInt());
+    } else if (value.IsInt64()) {
+      return std::to_string(value.GetInt64());
+    } else if (value.IsUint()) {
+      return std::to_string(value.GetUint());
+    } else if (value.IsUint64()) {
+      return std::to_string(value.GetUint64());
+    } else if (value.IsDouble()) {
+      return std::to_string(value.GetDouble());
+    }
+    break;
+  }
+  case rapidjson::Type::kStringType: {
+    return std::string{value.GetString()};
+  }
+  case rapidjson::Type::kNullType: {
+    return std::string{"null"};
+  }
+  case rapidjson::Type::kObjectType:
+  case rapidjson::Type::kArrayType: {
+    // These are not supported, use a Writer instead.
+    break;
+  }
+  }
+
+  return boost::none;
 }
 
 } // namespace osquery

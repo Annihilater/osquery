@@ -8,53 +8,82 @@
  */
 
 #include <openssl/opensslv.h>
+#include <openssl/pem.h>
 #include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include <osquery/core/core.h>
 #include <osquery/filesystem/filesystem.h>
 #include <osquery/logger/logger.h>
 #include <osquery/sql/sql.h>
 #include <osquery/tables/system/darwin/keychain.h>
+#include <osquery/tables/system/posix/openssl_utils.h>
 
 namespace osquery {
 namespace tables {
 
+// The table key for Keychain cache access.
+static const KeychainTable KEYCHAIN_TABLE = KeychainTable::CERTIFICATES;
+
 void genCertificate(X509* cert, const std::string& path, QueryData& results) {
   Row r;
 
-  // Generate the common name and subject.
-  // They are very similar OpenSSL API accessors so save some logic and
-  // generate them using output parameters.
-  genCommonName(cert, r["subject"], r["common_name"], r["issuer"]);
-  // Same with algorithm strings.
-  genAlgorithmProperties(
-      cert, r["key_algorithm"], r["signing_algorithm"], r["key_strength"]);
+  auto opt_issuer_name = getCertificateIssuerName(cert, true);
+  r["issuer"] = SQL_TEXT(opt_issuer_name.value_or(""));
 
-  // Most certificate field accessors return strings.
-  r["not_valid_before"] = INTEGER(genEpoch(X509_get_notBefore(cert)));
-  r["not_valid_after"] = INTEGER(genEpoch(X509_get_notAfter(cert)));
+  opt_issuer_name = getCertificateIssuerName(cert, false);
+  r["issuer2"] = SQL_TEXT(opt_issuer_name.value_or(""));
+
+  auto opt_subject_name = getCertificateSubjectName(cert, true);
+  r["subject"] = SQL_TEXT(opt_subject_name.value_or(""));
+
+  opt_subject_name = getCertificateSubjectName(cert, false);
+  r["subject2"] = SQL_TEXT(opt_subject_name.value_or(""));
+
+  auto opt_common_name = getCertificateCommonName(cert);
+  r["common_name"] = SQL_TEXT(opt_common_name.value_or(""));
+
+  auto opt_signing_algorithm = getCertificateSigningAlgorithm(cert);
+  r["signing_algorithm"] = SQL_TEXT(opt_signing_algorithm.value_or(""));
+
+  auto opt_key_algorithm = getCertificateKeyAlgorithm(cert);
+  r["key_algorithm"] = SQL_TEXT(opt_key_algorithm.value_or(""));
+
+  auto opt_key_strength = getCertificateKeyStregth(cert);
+  r["key_strength"] = SQL_TEXT(opt_key_strength.value_or(""));
+
+  auto opt_not_valid_before = getCertificateNotValidBefore(cert);
+  r["not_valid_before"] = INTEGER(opt_not_valid_before.value_or(0));
+
+  auto opt_not_valid_after = getCertificateNotValidAfter(cert);
+  r["not_valid_after"] = INTEGER(opt_not_valid_after.value_or(0));
 
   // Get the keychain for the certificate.
   r["path"] = path;
   // Hash is not a certificate property, calculate using raw data.
-  r["sha1"] = genSHA1ForCertificate(cert);
+  auto opt_digest = generateCertificateSHA1Digest(cert);
+  r["sha1"] = SQL_TEXT(opt_digest.value_or(""));
 
   // X509_check_ca() populates key_usage, {authority,subject}_key_id
   // so it should be called before others.
-  r["ca"] = (CertificateIsCA(cert)) ? INTEGER(1) : INTEGER(0);
-  r["self_signed"] = (CertificateIsSelfSigned(cert)) ? INTEGER(1) : INTEGER(0);
+  bool is_ca{};
+  bool is_self_signed{};
+  getCertificateAttributes(cert, is_ca, is_self_signed);
 
-  r["key_usage"] = genKeyUsage(X509_get_key_usage(cert));
+  r["ca"] = is_ca ? INTEGER(1) : INTEGER(0);
+  r["self_signed"] = is_self_signed ? INTEGER(1) : INTEGER(0);
 
-  const auto* cert_key_id = X509_get0_authority_key_id(cert);
-  r["authority_key_id"] =
-      cert_key_id ? genKIDProperty(cert_key_id->data, cert_key_id->length) : "";
+  auto opt_cert_key_usage = getCertificateKeyUsage(cert);
+  r["key_usage"] = opt_cert_key_usage.value_or("");
 
-  cert_key_id = X509_get0_subject_key_id(cert);
-  r["subject_key_id"] =
-      cert_key_id ? genKIDProperty(cert_key_id->data, cert_key_id->length) : "";
+  auto opt_authority_key_id = getCertificateAuthorityKeyID(cert);
+  r["authority_key_id"] = SQL_TEXT(opt_authority_key_id.value_or(""));
 
-  r["serial"] = genSerialForCertificate(cert);
+  auto opt_subject_key_id = getCertificateSubjectKeyID(cert);
+  r["subject_key_id"] = SQL_TEXT(opt_subject_key_id.value_or(""));
+
+  auto opt_cert_serial_number = getCertificateSerialNumber(cert);
+  r["serial"] = SQL_TEXT(opt_cert_serial_number.value_or(""));
 
   results.push_back(r);
 }
@@ -110,6 +139,9 @@ void genFileCertificate(const std::string& path, QueryData& results) {
 QueryData genCerts(QueryContext& context) {
   QueryData results;
 
+  // Lock keychain access to 1 table/thread at a time.
+  std::unique_lock<decltype(keychainMutex)> lock(keychainMutex);
+
   // Allow the caller to set both an explicit keychain search path
   // and certificate files on disk.
   std::set<std::string> keychain_paths;
@@ -133,49 +165,150 @@ QueryData genCerts(QueryContext& context) {
       }));
 
   @autoreleasepool {
+    // Map of path to hash and keychain reference. This ensures we don't open
+    // the same keychain multiple times when the table's path constraint is
+    // used.
+    std::map<std::string,
+             std::tuple<boost::filesystem::path, std::string, SecKeychainRef>>
+        opened_keychains;
     if (!paths.empty()) {
       for (const auto& path : paths) {
+        // Check whether path is valid
+        boost::system::error_code ec;
+        auto source =
+            boost::filesystem::canonical(boost::filesystem::path(path), ec);
+        if (ec.failed() || !is_regular_file(source, ec) || ec.failed()) {
+          TLOG << "Could not access file " << path << " " << ec.message();
+          continue;
+        }
+
+        // Check cache
+        bool err = false;
+        std::string hash;
+        bool hit =
+            keychainCache.Read(source, KEYCHAIN_TABLE, hash, results, err);
+        if (err) {
+          TLOG << "Could not read the file at " << path << "" << ec.message();
+          continue;
+        }
+        if (hit) {
+          continue;
+        }
+
         SecKeychainRef keychain = nullptr;
         SecKeychainStatus keychain_status;
-        auto status = SecKeychainOpen(path.c_str(), &keychain);
-        if (status != errSecSuccess || keychain == nullptr ||
-            SecKeychainGetStatus(keychain, &keychain_status) != errSecSuccess) {
+        OSStatus status;
+        OSQUERY_USE_DEPRECATED(status =
+                                   SecKeychainOpen(path.c_str(), &keychain));
+        bool genFileCert = false;
+        if (status != errSecSuccess || keychain == nullptr) {
+          genFileCert = true;
+        } else {
+          OSQUERY_USE_DEPRECATED(
+              status = SecKeychainGetStatus(keychain, &keychain_status));
+          if (status != errSecSuccess) {
+            genFileCert = true;
+          }
+        }
+        if (genFileCert) {
           if (keychain != nullptr) {
             CFRelease(keychain);
           }
-          genFileCertificate(path, results);
+          QueryData new_results;
+          genFileCertificate(path, new_results);
+          // Write new results to the cache.
+          keychainCache.Write(source, KEYCHAIN_TABLE, hash, new_results);
+          results.insert(results.end(), new_results.begin(), new_results.end());
         } else {
+          // This path will be re-accessed later.
           keychain_paths.insert(path);
-          CFRelease(keychain);
+          opened_keychains.insert(
+              {path, std::make_tuple(source, hash, keychain)});
         }
       }
     } else {
-      for (const auto& path : kSystemKeychainPaths) {
-        keychain_paths.insert(path);
-      }
-      auto homes = osquery::getHomeDirectories();
-      for (const auto& dir : homes) {
-        for (const auto& keychains_dir : kUserKeychainPaths) {
-          keychain_paths.insert((dir / keychains_dir).string());
-        }
-      }
+      keychain_paths = getKeychainPaths();
     }
 
-    // Keychains/certificate stores belonging to the OS.
-    CFArrayRef certs =
-        CreateKeychainItems(keychain_paths, kSecClassCertificate);
-    // Must have returned an array of matching certificates.
-    if (certs != nullptr) {
-      if (CFGetTypeID(certs) == CFArrayGetTypeID()) {
-        auto certificate_count = CFArrayGetCount(certs);
-        for (CFIndex i = 0; i < certificate_count; i++) {
-          auto cert = (SecCertificateRef)CFArrayGetValueAtIndex(certs, i);
-          genKeychainCertificate(cert, results);
+    // Since we are used a cache for each keychain file, we must process
+    // certificates one keychain file at a time.
+    std::set<std::string> expanded_paths = expandPaths(keychain_paths);
+    for (const auto& path : expanded_paths) {
+      SecKeychainRef keychain = nullptr;
+      std::string hash;
+      boost::filesystem::path source;
+      auto it = opened_keychains.find(path);
+      if (it != opened_keychains.end()) {
+        source = std::get<0>(it->second);
+        hash = std::get<1>(it->second);
+        keychain = std::get<2>(it->second);
+      } else {
+        // Check whether path is valid
+        boost::system::error_code ec;
+        source =
+            boost::filesystem::canonical(boost::filesystem::path(path), ec);
+        if (ec.failed() || !is_regular_file(source, ec) || ec.failed()) {
+          // File does not exist or user does not have access. Don't log here to
+          // reduce noise.
+          continue;
+        }
+
+        // Check cache
+        bool err = false;
+        bool hit =
+            keychainCache.Read(source, KEYCHAIN_TABLE, hash, results, err);
+        if (err) {
+          TLOG << "Could not read the file at " << source.string() << ""
+               << ec.message();
+          continue;
+        }
+        if (hit) {
+          continue;
+        }
+
+        // Cache miss. We need to generate new results.
+        OSStatus status;
+        OSQUERY_USE_DEPRECATED(status =
+                                   SecKeychainOpen(source.c_str(), &keychain));
+        if (status != errSecSuccess || keychain == nullptr) {
+          if (keychain != nullptr) {
+            CFRelease(keychain);
+          }
+          // Cache an empty result to prevent the above API call in the future.
+          keychainCache.Write(source, KEYCHAIN_TABLE, hash, {});
+          continue;
         }
       }
-      CFRelease(certs);
+
+      auto keychains = CFArrayCreateMutable(nullptr, 1, &kCFTypeArrayCallBacks);
+      CFArrayAppendValue(keychains, keychain);
+      QueryData new_results;
+      // Keychains/certificate stores belonging to the OS.
+      CFArrayRef certs = CreateKeychainItems(keychains, kSecClassCertificate);
+      CFRelease(keychains);
+      // Must have returned an array of matching certificates.
+      if (certs != nullptr) {
+        if (CFGetTypeID(certs) == CFArrayGetTypeID()) {
+          auto certificate_count = CFArrayGetCount(certs);
+          for (CFIndex i = 0; i < certificate_count; i++) {
+            auto cert = (SecCertificateRef)CFArrayGetValueAtIndex(certs, i);
+            genKeychainCertificate(cert, new_results);
+          }
+        }
+        CFRelease(certs);
+        keychainCache.Write(source, KEYCHAIN_TABLE, hash, new_results);
+        results.insert(results.end(), new_results.begin(), new_results.end());
+      } else {
+        // Cache an empty result to prevent the above API call in the future.
+        keychainCache.Write(source, KEYCHAIN_TABLE, hash, {});
+      }
     }
   }
+
+  if (FLAGS_keychain_access_cache) {
+    TLOG << "Total Keychain Cache entries: " << keychainCache.Size();
+  }
+
   return results;
 }
 }

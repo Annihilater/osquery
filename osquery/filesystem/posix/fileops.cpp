@@ -7,8 +7,8 @@
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
 
-#include <osquery/filesystem/filesystem.h>
 #include <osquery/filesystem/fileops.h>
+#include <osquery/filesystem/filesystem.h>
 
 #include <glob.h>
 #include <pwd.h>
@@ -32,7 +32,6 @@ PlatformFile::PlatformFile(const fs::path& path, int mode, int perms)
     : fname_(path) {
   int oflag = 0;
   bool may_create = false;
-  bool check_existence = false;
 
   if ((mode & PF_READ) == PF_READ && (mode & PF_WRITE) == PF_WRITE) {
     oflag = O_RDWR;
@@ -52,7 +51,7 @@ PlatformFile::PlatformFile(const fs::path& path, int mode, int perms)
     may_create = true;
     break;
   case PF_GET_OPTIONS(PF_OPEN_EXISTING):
-    check_existence = true;
+    // Nothing to do, open will fail with -1 if it doesn't exist
     break;
   case PF_GET_OPTIONS(PF_OPEN_ALWAYS):
     oflag |= O_CREAT;
@@ -81,13 +80,7 @@ PlatformFile::PlatformFile(const fs::path& path, int mode, int perms)
     perms = 0666;
   }
 
-  boost::system::error_code ec;
-  if (check_existence &&
-      (!fs::exists(fname_, ec) || ec.value() != errc::success)) {
-    handle_ = kInvalidHandle;
-  } else {
-    handle_ = ::open(fname_.c_str(), oflag, perms);
-  }
+  handle_ = ::open(fname_.c_str(), oflag, perms);
 }
 
 PlatformFile::~PlatformFile() {
@@ -191,14 +184,6 @@ bool PlatformFile::getFileTimes(PlatformTime& times) {
   return true;
 }
 
-bool PlatformFile::setFileTimes(const PlatformTime& times) {
-  if (!isValid()) {
-    return false;
-  }
-
-  return (::futimes(handle_, times.times) == 0);
-}
-
 ssize_t PlatformFile::read(void* buf, size_t nbyte) {
   if (!isValid()) {
     return -1;
@@ -291,8 +276,7 @@ std::vector<std::string> platformGlob(const std::string& find_path) {
   std::vector<std::string> results;
 
   auto data = (glob_t*)alloca(sizeof(glob_t));
-  ::glob(
-      find_path.c_str(), GLOB_TILDE | GLOB_MARK | GLOB_BRACE, nullptr, data);
+  ::glob(find_path.c_str(), GLOB_TILDE | GLOB_MARK | GLOB_BRACE, nullptr, data);
   size_t count = data->gl_pathc;
 
   for (size_t index = 0; index < count; index++) {
@@ -377,4 +361,23 @@ Status platformLstat(const std::string& path, struct stat& d_stat) {
   }
   return Status(0);
 }
+
+boost::optional<bool> platformIsFile(int fd) {
+  struct stat d_stat {};
+  if (::fstat(fd, &d_stat) < 0) {
+    return boost::none;
+  }
+
+  return S_ISREG(d_stat.st_mode);
 }
+
+Status platformFileno(FILE* file, int& fd) {
+  fd = ::fileno(file);
+
+  if (fd < 0) {
+    return Status(errno);
+  }
+
+  return Status::success();
+}
+} // namespace osquery

@@ -9,34 +9,50 @@
 
 #include <algorithm>
 #include <fstream>
+#include <random>
 
 #include <stdio.h>
+#include <sys/stat.h>
 
 #include <gtest/gtest.h>
 
 #include <boost/filesystem.hpp>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_generators.hpp>
+#include <boost/uuid/uuid_io.hpp>
 
 #include <osquery/filesystem/filesystem.h>
 
 #include <osquery/core/flags.h>
 #include <osquery/core/system.h>
+#include <osquery/filesystem/mock_file_structure.h>
 #include <osquery/logger/logger.h>
 #include <osquery/process/process.h>
-
 #include <osquery/utils/info/platform_type.h>
 
-#include <osquery/filesystem/mock_file_structure.h>
-
-// Some proc* functions are only compiled when building on linux
-#ifdef __linux__
-#include "osquery/filesystem/linux/proc.h"
+#ifdef WIN32
+#include "winbase.h"
+#include <osquery/utils/conversions/windows/strings.h>
 #endif
 
 namespace fs = boost::filesystem;
 
 namespace osquery {
 
+namespace {
+
+const std::vector<std::string> kFileNameList{
+    "辞書.txt",
+    "test_file.txt",
+};
+
+}
+
 DECLARE_uint64(read_max);
+
+extern inline Status listInAbsoluteDirectory(const fs::path& path,
+                                             std::vector<std::string>& results,
+                                             GlobLimits limits);
 
 class FilesystemTests : public testing::Test {
  protected:
@@ -44,10 +60,11 @@ class FilesystemTests : public testing::Test {
   fs::path fake_directory_;
 
   void SetUp() override {
+    initializeFilesystemAPILocale();
+
     fake_directory_ = fs::canonical(createMockFileStructure());
-    test_working_dir_ =
-        fs::temp_directory_path() /
-        fs::unique_path("osquery.test_working_dir.%%%%.%%%%");
+    test_working_dir_ = fs::temp_directory_path() /
+                        fs::unique_path("osquery.test_working_dir.%%%%.%%%%");
     fs::create_directories(test_working_dir_);
 
     if (isPlatform(PlatformType::TYPE_WINDOWS)) {
@@ -78,6 +95,81 @@ class FilesystemTests : public testing::Test {
     return !(std::find(all.begin(), all.end(), n) == all.end());
   }
 
+  /// Helper method to generate a random names
+  std::string genRandomName() {
+    return boost::uuids::to_string(boost::uuids::random_generator()());
+  }
+
+  /// Helper method to create nested directory structures
+  bool createNestedDirectories(const fs::path& parent,
+                               unsigned int subdir_count,
+                               unsigned int& created_dirs) {
+    if (!fs::create_directory(parent)) {
+      return false;
+    }
+
+    created_dirs++;
+    for (unsigned int it = 0; it < subdir_count; ++it) {
+      if (fs::create_directory(parent / genRandomName())) {
+        created_dirs++;
+      }
+    }
+
+    return true;
+  }
+
+  /// Helper method to create directory symlinks
+  bool createDirectorySymlink(const fs::path& target,
+                              const fs::path& link,
+                              unsigned int& created_dir_symlink) {
+    bool ret = false;
+
+    try {
+      fs::create_directory_symlink(target, link);
+      created_dir_symlink++;
+      ret = true;
+    } catch (const fs::filesystem_error& e) {
+      std::cerr << "Error creating symlink: " << e.what() << std::endl;
+    }
+
+    return ret;
+  }
+
+  /// Helper method to delete directory and its content
+  bool deleteDirectoryContent(const fs::path& dir_path) {
+    bool ret = false;
+
+    try {
+      fs::remove_all(dir_path);
+      ret = true;
+    } catch (const fs::filesystem_error& e) {
+      std::cerr << "Error deleting directory content: " << e.what()
+                << std::endl;
+    }
+
+    return ret;
+  }
+
+  /// Helper method to get a random number
+  unsigned int getRandomNumber() {
+    const unsigned int MAX_DIST_NUMBER = 30;
+    static std::default_random_engine engine(
+        (unsigned int)std::chrono::system_clock::now()
+            .time_since_epoch()
+            .count());
+    static std::uniform_int_distribution<unsigned int> dist(1, MAX_DIST_NUMBER);
+
+    return dist(engine);
+  }
+
+  // legacy listDirectoriesInDirectory logic
+  Status legacyListDirectoriesInDirectory(const fs::path& path,
+                                          std::vector<std::string>& results,
+                                          bool recursive) {
+    return listInAbsoluteDirectory(
+        (path / ((recursive) ? "**" : "*")), results, GLOB_FOLDERS);
+  }
+
  protected:
   std::string etc_hosts_path_;
   std::string etc_path_;
@@ -87,84 +179,94 @@ class FilesystemTests : public testing::Test {
 };
 
 TEST_F(FilesystemTests, test_read_file) {
-  std::ofstream test_file((test_working_dir_ / "fstests-file").string());
-  test_file.write("test123\n", sizeof("test123"));
-  test_file.close();
+  for (const auto& file_name : kFileNameList) {
+    auto file_path = test_working_dir_ / file_name;
 
-  std::string content;
-  auto s = readFile(test_working_dir_ / "fstests-file", content);
+    std::ofstream test_file(file_path.string());
+    test_file.write("test123\n", sizeof("test123"));
+    test_file.close();
 
-  EXPECT_TRUE(s.ok());
-  EXPECT_EQ(s.toString(), "OK");
-  EXPECT_EQ(content, "test123" + line_ending_);
+    std::string content;
+    auto s = readFile(file_path, content);
 
-  removePath(test_working_dir_ / "fstests-file");
+    EXPECT_TRUE(s.ok());
+    EXPECT_EQ(s.toString(), "OK");
+    EXPECT_EQ(content, "test123" + line_ending_);
+
+    removePath(file_path);
+  }
 }
 
 TEST_F(FilesystemTests, test_remove_path) {
-  auto test_dir = test_working_dir_ / "rmdir";
-  fs::create_directories(test_dir);
+  for (const auto& file_name : kFileNameList) {
+    auto test_dir = test_working_dir_ / file_name;
+    fs::create_directories(test_dir);
 
-  auto test_file = test_working_dir_ / "rmdir/rmfile";
-  writeTextFile(test_file, "testcontent");
+    auto test_file = test_working_dir_ / file_name / "rmfile";
+    writeTextFile(test_file, "testcontent");
 
-  ASSERT_TRUE(pathExists(test_file).ok());
+    ASSERT_TRUE(pathExists(test_file).ok());
 
-  // Try to remove the directory.
-  EXPECT_TRUE(removePath(test_dir));
-  EXPECT_FALSE(pathExists(test_file).ok());
-  EXPECT_FALSE(pathExists(test_dir).ok());
+    // Try to remove the directory.
+    EXPECT_TRUE(removePath(test_dir));
+    EXPECT_FALSE(pathExists(test_file).ok());
+    EXPECT_FALSE(pathExists(test_dir).ok());
+  }
 }
 
 TEST_F(FilesystemTests, test_write_file) {
-  auto test_file = test_working_dir_ / "fstests-file2";
-  std::string content(2048, 'A');
+  for (const auto& file_name : kFileNameList) {
+    auto test_file = test_working_dir_ / file_name;
+    std::string content(2048, 'A');
 
-  EXPECT_TRUE(writeTextFile(test_file, content).ok());
-  ASSERT_TRUE(pathExists(test_file).ok());
-  ASSERT_TRUE(isWritable(test_file).ok());
-  ASSERT_TRUE(removePath(test_file).ok());
+    EXPECT_TRUE(writeTextFile(test_file, content).ok());
+    ASSERT_TRUE(pathExists(test_file).ok());
+    ASSERT_TRUE(isWritable(test_file).ok());
+    ASSERT_TRUE(removePath(test_file).ok());
 
-  EXPECT_TRUE(writeTextFile(test_file, content, 0400));
-  ASSERT_TRUE(pathExists(test_file).ok());
+    EXPECT_TRUE(writeTextFile(test_file, content, 0400));
+    ASSERT_TRUE(pathExists(test_file).ok());
 
-  // On POSIX systems, root can still read/write.
-  EXPECT_FALSE(isWritable(test_file).ok());
-  EXPECT_TRUE(isReadable(test_file).ok());
-  ASSERT_TRUE(removePath(test_file).ok());
+    // On POSIX systems, root can still read/write.
+    EXPECT_FALSE(isWritable(test_file).ok());
+    EXPECT_TRUE(isReadable(test_file).ok());
+    ASSERT_TRUE(removePath(test_file).ok());
 
-  EXPECT_TRUE(writeTextFile(test_file, content, 0000));
-  ASSERT_TRUE(pathExists(test_file).ok());
+    EXPECT_TRUE(writeTextFile(test_file, content, 0000));
+    ASSERT_TRUE(pathExists(test_file).ok());
 
-  // On POSIX systems, root can still read/write.
-  EXPECT_FALSE(isWritable(test_file).ok());
-  EXPECT_FALSE(isReadable(test_file).ok());
-  ASSERT_TRUE(removePath(test_file).ok());
+    // On POSIX systems, root can still read/write.
+    EXPECT_FALSE(isWritable(test_file).ok());
+    EXPECT_FALSE(isReadable(test_file).ok());
+    ASSERT_TRUE(removePath(test_file).ok());
+  }
 }
 
 TEST_F(FilesystemTests, test_readwrite_file) {
-  auto test_file = test_working_dir_ / "fstests-file3";
-  size_t filesize = 4096 * 10;
+  for (const auto& file_name : kFileNameList) {
+    auto test_file = test_working_dir_ / file_name;
+    size_t filesize = 4096 * 10;
 
-  std::string in_content(filesize, 'A');
-  EXPECT_TRUE(writeTextFile(test_file, in_content).ok());
-  ASSERT_TRUE(pathExists(test_file).ok());
-  ASSERT_TRUE(isReadable(test_file).ok());
+    std::string in_content(filesize, 'A');
+    EXPECT_TRUE(writeTextFile(test_file, in_content).ok());
+    ASSERT_TRUE(pathExists(test_file).ok());
+    ASSERT_TRUE(isReadable(test_file).ok());
 
-  // Now read the content back.
-  std::string out_content;
-  EXPECT_TRUE(readFile(test_file, out_content).ok());
-  EXPECT_EQ(filesize, out_content.size());
-  EXPECT_EQ(in_content, out_content);
-  removePath(test_file);
+    // Now read the content back.
+    std::string out_content;
+    EXPECT_TRUE(readFile(test_file, out_content).ok());
+    EXPECT_EQ(filesize, out_content.size());
+    EXPECT_EQ(in_content, out_content);
+    removePath(test_file);
 
-  // Now try to write outside of a 4k chunk size.
-  in_content = std::string(filesize + 1, 'A');
-  writeTextFile(test_file, in_content);
-  out_content.clear();
-  readFile(test_file, out_content);
-  EXPECT_EQ(in_content, out_content);
-  removePath(test_file);
+    // Now try to write outside of a 4k chunk size.
+    in_content = std::string(filesize + 1, 'A');
+    writeTextFile(test_file, in_content);
+    out_content.clear();
+    readFile(test_file, out_content);
+    EXPECT_EQ(in_content, out_content);
+    removePath(test_file);
+  }
 }
 
 TEST_F(FilesystemTests, test_read_limit) {
@@ -183,14 +285,6 @@ TEST_F(FilesystemTests, test_read_limit) {
   // Any the links are readable too.
   status = readFile(fake_directory_ / "root2.txt", content);
   EXPECT_TRUE(status.ok());
-}
-
-TEST_F(FilesystemTests, test_read_size) {
-  std::string content;
-  size_t s = 3;
-  auto status = readFile(fake_directory_ / "root.txt", content, s);
-  EXPECT_TRUE(status.ok());
-  EXPECT_EQ(content.size(), s);
 }
 
 TEST_F(FilesystemTests, test_list_files_missing_directory) {
@@ -219,17 +313,16 @@ TEST_F(FilesystemTests, test_list_files_valid_directory) {
 
 TEST_F(FilesystemTests, test_intermediate_globbing_directories) {
   fs::path thirdLevelDir =
-      fs::path(fake_directory_) / "toplevel/%/thirdlevel1";
+      fs::path(fake_directory_) / kTopLevelMockFolderName / "%/thirdlevel1";
   std::vector<std::string> results;
   resolveFilePattern(thirdLevelDir, results);
   EXPECT_EQ(results.size(), 1U);
 }
 
 TEST_F(FilesystemTests, test_canonicalization) {
-  std::string complex_path =
-      (fs::path(fake_directory_) / "deep1/../deep1/..")
-          .make_preferred()
-          .string();
+  std::string complex_path = (fs::path(fake_directory_) / "deep1/../deep1/..")
+                                 .make_preferred()
+                                 .string();
   std::string simple_path = fake_directory_.make_preferred().string();
 
   if (isPlatform(PlatformType::TYPE_WINDOWS)) {
@@ -244,16 +337,16 @@ TEST_F(FilesystemTests, test_canonicalization) {
   replaceGlobWildcards(complex_path);
   EXPECT_EQ(simple_path, complex_path);
 
-  // Now apply the same inline replacement on the simple_path directory and expect
-  // no change to the comparison.
+  // Now apply the same inline replacement on the simple_path directory and
+  // expect no change to the comparison.
   replaceGlobWildcards(simple_path);
   EXPECT_EQ(simple_path, complex_path);
 
   // Now add a wildcard within the complex_path pattern. The replacement method
   // will not canonicalize past a '*' as the proceeding paths are limiters.
   complex_path = (fs::path(fake_directory_) / "*/deep2/../deep2/")
-                .make_preferred()
-                .string();
+                     .make_preferred()
+                     .string();
   replaceGlobWildcards(complex_path);
   EXPECT_EQ(complex_path,
             (fs::path(fake_directory_) / "*/deep2/../deep2/")
@@ -265,7 +358,7 @@ TEST_F(FilesystemTests, test_simple_globs) {
   std::vector<std::string> results;
 
   // Test the shell '*', we will support SQL's '%' too.
-  auto status = resolveFilePattern(fake_directory_  / "*", results);
+  auto status = resolveFilePattern(fake_directory_ / "*", results);
   EXPECT_TRUE(status.ok());
   EXPECT_EQ(results.size(), 7U);
 
@@ -439,30 +532,6 @@ TEST_F(FilesystemTests, test_safe_permissions) {
   }
 }
 
-// This will fail to link (procGetNamespaceInode) if we are not
-// compiling on linux
-#ifdef __linux__
-TEST_F(FilesystemTests, test_user_namespace_parser) {
-  auto unique_path = fs::temp_directory_path() /
-                     fs::unique_path("osquery.tests.user_ns_parser.%%%%.%%%%");
-
-  auto temp_path = unique_path.native();
-
-  boost::system::error_code error_code;
-  EXPECT_EQ(fs::create_directory(temp_path, error_code), true);
-
-  auto symlink_path = temp_path + "/namespace";
-  EXPECT_EQ(symlink("namespace:[112233]", symlink_path.data()), 0);
-
-  ino_t namespace_inode;
-  auto status = procGetNamespaceInode(namespace_inode, "namespace", temp_path);
-  EXPECT_TRUE(status.ok());
-
-  removePath(temp_path);
-  EXPECT_EQ(namespace_inode, static_cast<ino_t>(112233));
-}
-#endif
-
 TEST_F(FilesystemTests, test_read_proc) {
   std::string content;
 
@@ -480,29 +549,6 @@ TEST_F(FilesystemTests, test_read_symlink) {
     auto status = readFile(fake_directory_ / "root2.txt", content);
     EXPECT_TRUE(status.ok());
     EXPECT_EQ(content, "root");
-  }
-}
-
-TEST_F(FilesystemTests, test_read_zero) {
-  std::string content;
-
-  if (!isPlatform(PlatformType::TYPE_WINDOWS)) {
-    auto status = readFile("/dev/zero", content, 10);
-    EXPECT_EQ(content.size(), 10U);
-    for (size_t i = 0; i < 10; i++) {
-      EXPECT_EQ(content[i], 0);
-    }
-  }
-}
-
-TEST_F(FilesystemTests, test_read_urandom) {
-  std::string first, second;
-
-  if (!isPlatform(PlatformType::TYPE_WINDOWS)) {
-    auto status = readFile("/dev/urandom", first, 10);
-    EXPECT_TRUE(status.ok());
-    status = readFile("/dev/urandom", second, 10);
-    EXPECT_NE(first, second);
   }
 }
 
@@ -596,6 +642,278 @@ TEST_F(FilesystemTests, test_read_empty_file) {
   std::string content;
   ASSERT_TRUE(readFile(test_file, content));
   ASSERT_TRUE(content.empty());
+}
+
+TEST_F(FilesystemTests, test_directory_listing_with_no_nested_dirs) {
+  // This test verifies that directories are properly listed. No nested dir
+  // structure is generated. Recursive directory listing flag in
+  // listDirectoriesInDirectory() is set to false.
+  const unsigned int MAX_DIRS = 450;
+  const fs::path test_root_dir = fs::temp_directory_path() / genRandomName();
+
+  ASSERT_TRUE(fs::create_directory(test_root_dir));
+
+  unsigned int created_directories = 0;
+  for (unsigned int i = 0; i < MAX_DIRS; ++i) {
+    const fs::path work_dir = test_root_dir / genRandomName();
+    ASSERT_TRUE(createNestedDirectories(work_dir, 0, created_directories));
+  }
+
+  std::vector<std::string> found_directories;
+  ASSERT_TRUE(
+      listDirectoriesInDirectory(test_root_dir, found_directories, false));
+
+  ASSERT_TRUE(!found_directories.empty());
+
+  ASSERT_TRUE(found_directories.size() == (size_t)created_directories);
+
+  deleteDirectoryContent(test_root_dir);
+}
+
+TEST_F(FilesystemTests, test_directory_listing_with_nested_dirs) {
+  // This test verifies that directories are properly listed. Nested dir
+  // structure is generated. Recursive directory listing flag in
+  // listDirectoriesInDirectory() is set to true.
+  const unsigned int MAX_DIRS = 450;
+  const fs::path test_root_dir = fs::temp_directory_path() / genRandomName();
+
+  ASSERT_TRUE(fs::create_directory(test_root_dir));
+
+  unsigned int created_directories = 0;
+  for (unsigned int i = 0; i < MAX_DIRS; ++i) {
+    const fs::path work_dir = test_root_dir / genRandomName();
+    ASSERT_TRUE(createNestedDirectories(
+        work_dir, getRandomNumber(), created_directories));
+  }
+
+  std::vector<std::string> found_directories;
+  ASSERT_TRUE(
+      listDirectoriesInDirectory(test_root_dir, found_directories, true));
+
+  ASSERT_TRUE(!found_directories.empty());
+
+  ASSERT_TRUE(found_directories.size() == (size_t)created_directories);
+
+  deleteDirectoryContent(test_root_dir);
+}
+
+TEST_F(FilesystemTests, test_directory_listing_with_dir_symlink) {
+  // This test verifies that symlinks are properly listed. Nested dir
+  // structure is not generated. Recursive directory listing flag in
+  // listDirectoriesInDirectory() is set to false.
+  const unsigned int MAX_DIRS = 450;
+  const fs::path test_root_raw_dirs =
+      fs::temp_directory_path() / genRandomName();
+  const fs::path test_root_symlink_dirs =
+      fs::temp_directory_path() / genRandomName();
+
+  ASSERT_TRUE(fs::create_directory(test_root_raw_dirs));
+  ASSERT_TRUE(fs::create_directory(test_root_symlink_dirs));
+
+  unsigned int created_raw_directories = 0;
+  unsigned int created_symlink_directories = 0;
+  for (unsigned int i = 0; i < MAX_DIRS; ++i) {
+    const fs::path raw_dir = test_root_raw_dirs / genRandomName();
+    const fs::path symlink_dir = test_root_symlink_dirs / genRandomName();
+    ASSERT_TRUE(createNestedDirectories(raw_dir, 0, created_raw_directories));
+
+    ASSERT_TRUE(createDirectorySymlink(
+        raw_dir, symlink_dir, created_symlink_directories));
+  }
+
+  std::vector<std::string> found_directories;
+  ASSERT_TRUE(listDirectoriesInDirectory(
+      test_root_symlink_dirs, found_directories, false));
+  ASSERT_TRUE(!found_directories.empty());
+
+  ASSERT_TRUE(found_directories.size() == (size_t)created_symlink_directories);
+
+  deleteDirectoryContent(test_root_raw_dirs);
+  deleteDirectoryContent(test_root_symlink_dirs);
+}
+
+TEST_F(FilesystemTests, test_directory_listing_with_nested_dirs_and_symlinks) {
+  // This test verifies that symlinks and nested directories are properly
+  // listed. Nested dir structure is generated. Recursive directory listing flag
+  // in listDirectoriesInDirectory() is set to false.
+  const unsigned int MAX_DIRS = 450;
+  const fs::path test_root_raw_dirs =
+      fs::temp_directory_path() / genRandomName();
+  const fs::path test_root_work_dirs =
+      fs::temp_directory_path() / genRandomName();
+
+  ASSERT_TRUE(fs::create_directory(test_root_raw_dirs));
+  ASSERT_TRUE(fs::create_directory(test_root_work_dirs));
+
+  unsigned int created_target_symlink_directories = 0;
+  unsigned int created_symlink_directories = 0;
+  unsigned int created_raw_directories = 0;
+
+  for (unsigned int i = 0; i < MAX_DIRS; ++i) {
+    const fs::path raw_dir = test_root_raw_dirs / genRandomName();
+    const fs::path symlink_dir = test_root_work_dirs / genRandomName();
+    const fs::path work_dir = test_root_work_dirs / genRandomName();
+
+    ASSERT_TRUE(createNestedDirectories(
+        raw_dir, 0, created_target_symlink_directories));
+
+    ASSERT_TRUE(createDirectorySymlink(
+        raw_dir, symlink_dir, created_symlink_directories));
+
+    ASSERT_TRUE(createNestedDirectories(
+        work_dir, getRandomNumber(), created_raw_directories));
+  }
+
+  std::vector<std::string> found_directories;
+  ASSERT_TRUE(
+      listDirectoriesInDirectory(test_root_work_dirs, found_directories, true));
+
+  ASSERT_TRUE(!found_directories.empty());
+
+  ASSERT_TRUE(found_directories.size() ==
+              (size_t)(created_symlink_directories + created_raw_directories));
+
+  deleteDirectoryContent(test_root_raw_dirs);
+  deleteDirectoryContent(test_root_work_dirs);
+}
+
+#ifdef OSQUERY_WINDOWS
+TEST_F(FilesystemTests, test_directory_listing_with_recursive_junction) {
+  // This test verifies that a recursive directory junction can be handled by
+  // listDirectoriesInDirectory logic
+
+  const fs::path test_root_raw = fs::temp_directory_path() / genRandomName();
+  ASSERT_TRUE(fs::create_directory(test_root_raw));
+  const fs::path junction_dir = test_root_raw / genRandomName();
+
+  // Creating a junction directory that points to itself
+  std::string junction_dir_str = junction_dir.string();
+  std::string target_cmdline = "mklink /J ";
+  target_cmdline.append(junction_dir_str);
+  target_cmdline.append(" ");
+  target_cmdline.append(junction_dir_str);
+  target_cmdline.append(" > NUL");
+  system(target_cmdline.c_str());
+
+  std::vector<std::string> found_directories;
+  ASSERT_TRUE(
+      listDirectoriesInDirectory(test_root_raw, found_directories, false));
+  ASSERT_TRUE(found_directories.empty());
+
+  deleteDirectoryContent(test_root_raw);
+}
+#endif
+
+TEST_F(FilesystemTests, test_directory_listing_with_legacy_logic) {
+  // This test verifies that symlinks and nested directories are properly
+  // listed with current and legacy logic.
+
+  const unsigned int MAX_DIRS = 450;
+  const fs::path test_root_raw_dirs =
+      fs::temp_directory_path() / genRandomName();
+  const fs::path test_root_work_dirs =
+      fs::temp_directory_path() / genRandomName();
+
+  ASSERT_TRUE(fs::create_directory(test_root_raw_dirs));
+  ASSERT_TRUE(fs::create_directory(test_root_work_dirs));
+
+  unsigned int created_target_symlink_directories = 0;
+  unsigned int created_symlink_directories = 0;
+  unsigned int created_raw_directories = 0;
+
+  for (unsigned int i = 0; i < MAX_DIRS; ++i) {
+    const fs::path raw_dir = test_root_raw_dirs / genRandomName();
+    const fs::path symlink_dir = test_root_work_dirs / genRandomName();
+    const fs::path work_dir = test_root_work_dirs / genRandomName();
+
+    ASSERT_TRUE(createNestedDirectories(
+        raw_dir, 0, created_target_symlink_directories));
+
+    ASSERT_TRUE(createDirectorySymlink(
+        raw_dir, symlink_dir, created_symlink_directories));
+
+    ASSERT_TRUE(createNestedDirectories(
+        work_dir, getRandomNumber(), created_raw_directories));
+  }
+
+  std::vector<std::string> found_directories;
+  ASSERT_TRUE(
+      listDirectoriesInDirectory(test_root_work_dirs, found_directories, true));
+
+  ASSERT_TRUE(!found_directories.empty());
+
+  ASSERT_TRUE(found_directories.size() ==
+              (size_t)(created_symlink_directories + created_raw_directories));
+
+  std::vector<std::string> found_directories_legacy_logic;
+  ASSERT_TRUE(legacyListDirectoriesInDirectory(
+      test_root_work_dirs, found_directories_legacy_logic, true));
+  ASSERT_TRUE(found_directories.size() ==
+              found_directories_legacy_logic.size());
+
+  deleteDirectoryContent(test_root_raw_dirs);
+  deleteDirectoryContent(test_root_work_dirs);
+}
+
+TEST_F(FilesystemTests, test_directory_listing_with_file_symlink) {
+  // This test verifies that a file symlink is not mistaken for a directory.
+  const fs::path test_root_dir = fs::temp_directory_path() / genRandomName();
+  ASSERT_TRUE(fs::create_directory(test_root_dir));
+
+  std::ofstream test_file((test_root_dir / "test_file.txt").string());
+  test_file.close();
+
+  // Create symlink
+  try {
+    fs::create_symlink(test_root_dir / "test_file.txt", test_root_dir / "link");
+  } catch (const fs::filesystem_error& e) {
+    FAIL() << "Error creating symlink: " << e.what();
+  }
+
+  std::vector<std::string> found_directories;
+  ASSERT_TRUE(
+      listDirectoriesInDirectory(test_root_dir, found_directories, false));
+  ASSERT_TRUE(found_directories.empty());
+
+  // Test with recursive=true
+  ASSERT_TRUE(
+      listDirectoriesInDirectory(test_root_dir, found_directories, true));
+  ASSERT_TRUE(found_directories.empty());
+
+  deleteDirectoryContent(test_root_dir);
+}
+
+TEST_F(FilesystemTests, test_directory_listing_with_bad_symlinks) {
+  // This test verifies that bad symlinks are not mistaken for a directory.
+  const fs::path test_root_dir = fs::temp_directory_path() / genRandomName();
+  ASSERT_TRUE(fs::create_directory(test_root_dir));
+
+  // Create symlink that points to itself.
+  try {
+    fs::create_symlink(test_root_dir / "link", test_root_dir / "link");
+  } catch (const fs::filesystem_error& e) {
+    FAIL() << "Error creating symlink: " << e.what();
+  }
+
+  // Create symlink that points to non-existent file.
+  try {
+    fs::create_symlink(test_root_dir / "not_exists.txt",
+                       test_root_dir / "link2");
+  } catch (const fs::filesystem_error& e) {
+    FAIL() << "Error creating symlink: " << e.what();
+  }
+
+  std::vector<std::string> found_directories;
+  ASSERT_TRUE(
+      listDirectoriesInDirectory(test_root_dir, found_directories, false));
+  ASSERT_TRUE(found_directories.empty());
+
+  // Test with recursive=true
+  ASSERT_TRUE(
+      listDirectoriesInDirectory(test_root_dir, found_directories, true));
+  ASSERT_TRUE(found_directories.empty());
+
+  deleteDirectoryContent(test_root_dir);
 }
 
 } // namespace osquery
